@@ -1,0 +1,66 @@
+data:
+  dataset_dir: /data2/jack/libero_datasets/libero_10_openvla256
+  horizon: 6
+  camera_keys: [obs/agentview_rgb, obs/eye_in_hand_rgb]
+  action_key: actions
+  proprio_keys: [obs/joint_states, obs/gripper_states]
+  feature_cache_dir: null
+  expected_tasks: 10
+
+model:
+  encoder:
+    dim: 256
+    num_views: 2
+    proprio_dim: 9
+    vision_model_name: dinov2_vitb14
+    vision_repository: /home/jack/.cache/torch/hub/facebookresearch_dinov2_main
+    vision_pretrained: true
+    vision_image_size: 224
+    vision_feature_dim: 768
+    # A spatial 8x8 grid PER camera, not averaged camera CLS features.
+    # Set 16 for all native 224/14 patches; rebuild the feature cache.
+    vision_grid_size: 8
+    text_model_name: google-bert/bert-base-uncased
+    text_revision: main
+    text_feature_dim: 768
+    text_max_length: 64
+    text_local_files_only: true
+  representation:
+    kind: transformer
+    dim: 256
+    depth: 2
+    heads: 4
+    dropout: 0.0
+  conditioning:
+    input_dim: 256
+    output_dim: 2048
+  action_head:
+    action_dim: 7
+    horizon: 6
+    condition_dim: 2048
+    timestep_dim: 256
+    down_dims: [512, 1024, 1536]
+    kernel_size: 5
+    num_groups: 8
+    inference_steps: 4
+    noise_std: 1.0
+    clip_actions: true
+  representation_loss_weight: 0.0
+
+train:
+  max_steps: 100000
+  batch_size: 16
+  num_workers: 4
+  learning_rate: 0.0001
+  weight_decay: 0.000001
+  betas: [0.95, 0.999]
+  amp: true
+  amp_dtype: float16
+  max_grad_norm: 1.0
+  warmup_steps: 500
+  min_lr_ratio: 0.01
+  max_consecutive_optimizer_skips: 16
+  ema_decay: 0.9999
+  log_interval: 10
+  save_interval: 20000
+  seed: 42

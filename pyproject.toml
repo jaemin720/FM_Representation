@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "representation-fm"
+version = "0.1.0"
+description = "Modular multimodal representations and conditional flow-matching actions for LIBERO"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1", "torchvision>=0.16", "numpy>=1.24", "h5py>=3.8", "PyYAML>=6", "tqdm>=4.65", "transformers>=4.37,<5", "safetensors>=0.4"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
