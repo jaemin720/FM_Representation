@@ -107,6 +107,23 @@ def canonical_data_config(config: LiberoDatasetConfig) -> dict[str, Any]:
     return values
 
 
+def build_optimizer(model: torch.nn.Module, train_values: dict[str, Any]) -> AdamW:
+    """Include pretrained trainable weights, with their own fine-tuning rate."""
+    model.encoder.initialize_trainable_backbones(next(model.parameters()).device)
+    base_lr = float(train_values["learning_rate"])
+    vision_lr = float(train_values.get("vision_learning_rate", base_lr))
+    if not all(math.isfinite(rate) and rate > 0 for rate in (base_lr, vision_lr)):
+        raise ValueError("Learning rates must be finite and positive")
+    named = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
+    groups = [{"params": [p for n, p in named if not n.startswith("encoder.vision.backbone.")],
+               "lr": base_lr, "name": "policy"}]
+    vision = [p for n, p in named if n.startswith("encoder.vision.backbone.")]
+    if vision:
+        groups.append({"params": vision, "lr": vision_lr, "name": "vision"})
+    return AdamW(groups, lr=base_lr, weight_decay=float(train_values.get("weight_decay", 0.01)),
+                 betas=tuple(train_values.get("betas", (0.9, 0.999))))
+
+
 def main() -> None:
     args = arguments()
     values = yaml.safe_load(args.config.read_text())
@@ -160,10 +177,8 @@ def run_training(args: argparse.Namespace, values: dict[str, Any], train_values:
     loader_generator = torch.Generator().manual_seed(seed)
     loader = DataLoader(dataset, batch_sampler=sampler, num_workers=workers, pin_memory=device.type == "cuda",
                         persistent_workers=workers > 0, generator=loader_generator)
+    optimizer = build_optimizer(model, train_values)
     trainable = [value for value in model.parameters() if value.requires_grad]
-    optimizer = AdamW(trainable, lr=float(train_values["learning_rate"]),
-                      weight_decay=float(train_values.get("weight_decay", 0.01)),
-                      betas=tuple(train_values.get("betas", (0.9, 0.999))))
 
     def lr_multiplier(scheduler_step: int) -> float:
         if warmup_steps and scheduler_step < warmup_steps:
@@ -228,7 +243,12 @@ def run_training(args: argparse.Namespace, values: dict[str, Any], train_values:
     model.train()  # Encoder.train() keeps its frozen backbones in eval mode.
     print(f"Training setup | device={device} | windows={len(dataset):,} | tasks={len(dataset.tasks)} | "
           f"trainable_parameters={sum(value.numel() for value in trainable):,} | "
+          f"vision_trainable={model.encoder.config.vision_trainable} | text_trainable=False | "
           f"cached_inputs={dataset_config.feature_cache_dir is not None} | amp={amp_name if amp_enabled else 'off'}", flush=True)
+    print("Optimizer groups | " + " | ".join(
+        f"{group.get('name', 'policy')}: parameters={sum(p.numel() for p in group['params']):,}, base_lr={base_lr:g}"
+        for group, base_lr in zip(optimizer.param_groups, scheduler.base_lrs)
+    ), flush=True)
     if resume is not None:
         print("Resumed optimizer, EMA, RNG and consumed sample cursor. Worker-side random augmentation state is not saved.", flush=True)
     progress = tqdm(total=target, initial=step, desc="Training", unit="step", dynamic_ncols=True, mininterval=1)
@@ -296,6 +316,18 @@ def run_training(args: argparse.Namespace, values: dict[str, Any], train_values:
                     progress.set_postfix(amp_skip=consecutive_skips, scale=f"{scaler.get_scale():.0f}")
                     continue
                 consecutive_skips = 0
+                if step == 0 and model.encoder.config.vision_trainable:
+                    vision_gradients = [p.grad for p in model.encoder.vision.parameters()
+                                        if p.requires_grad and p.grad is not None]
+                    if not vision_gradients:
+                        raise RuntimeError("No gradient reached the trainable vision encoder")
+                    vision_norm = torch.stack([g.detach().float().norm() for g in vision_gradients]).norm()
+                    if not torch.isfinite(vision_norm) or vision_norm <= 0:
+                        raise FloatingPointError("Vision encoder gradient must be finite and nonzero")
+                    if any(p.requires_grad or p.grad is not None for p in model.encoder.text.parameters()):
+                        raise RuntimeError("BERT must remain frozen")
+                    progress.write(f"Backbone gradient check | vision_norm={float(vision_norm):.6g} | BERT=frozen")
+                    del vision_gradients
                 scheduler.step()
                 ema.update(model)
                 step += 1
@@ -303,6 +335,7 @@ def run_training(args: argparse.Namespace, values: dict[str, Any], train_values:
                 if step % log_interval == 0 or step == 1:
                     record = {"step": step, **{key: float(value.detach()) for key, value in losses.items()},
                               "lr": optimizer.param_groups[0]["lr"], "gradient_norm": float(gradient_norm),
+                              "learning_rates": {group.get("name", "policy"): group["lr"] for group in optimizer.param_groups},
                               "elapsed_seconds": time.perf_counter() - started}
                     metrics.write(json.dumps(record) + "\n")
                     metrics.flush()

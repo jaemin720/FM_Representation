@@ -1,4 +1,4 @@
-"""Current-observation tokens; pretrained backbones are frozen and loaded lazily.
+"""Current-observation tokens with optional DINOv2 fine-tuning and frozen BERT.
 
 Image preprocessing is adapted from ../DP/src/dp/model.py. Unlike that source,
 this module preserves camera/spatial tokens and encodes actual language.
@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import warnings
 from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -28,6 +29,7 @@ class EncoderConfig:
     vision_model_name: str = "dinov2_vitb14"
     vision_repository: str = "facebookresearch/dinov2"
     vision_pretrained: bool = True
+    vision_trainable: bool = False
     vision_image_size: int = 224
     vision_feature_dim: int = 768
     vision_grid_size: int = 8
@@ -53,11 +55,14 @@ class EncoderConfig:
 
     def cache_signature(self) -> dict[str, Any]:
         """Only frozen feature extraction settings, not trainable token widths."""
+        if self.vision_trainable:
+            raise ValueError("Image feature caches cannot be used with a trainable vision encoder")
         return {k: v for k, v in asdict(self).items()
-                if k.startswith(("vision_", "text_")) or k == "num_views"}
+                if (k.startswith(("vision_", "text_")) or k == "num_views")
+                and k != "vision_trainable"}
 
 
-class FrozenVisionTokens(nn.Module):
+class VisionTokens(nn.Module):
     def __init__(self, config: EncoderConfig) -> None:
         super().__init__()
         self.config = config
@@ -77,14 +82,18 @@ class FrozenVisionTokens(nn.Module):
                     repo, self.config.vision_model_name,
                     pretrained=self.config.vision_pretrained, source=source,
                 )
-            self.backbone.requires_grad_(False).eval()
-        return self.backbone.to(device=device, dtype=torch.float32).eval()
+            self.backbone.requires_grad_(self.config.vision_trainable)
+            # This policy never masks image patches, so this token is unused.
+            if hasattr(self.backbone, "mask_token"):
+                self.backbone.mask_token.requires_grad_(False)
+        return self.backbone.to(device=device, dtype=torch.float32).train(
+            self.training if self.config.vision_trainable else False,
+        )
 
-    def train(self, mode: bool = True) -> FrozenVisionTokens:
-        super().train(False)
+    def train(self, mode: bool = True) -> VisionTokens:
+        super().train(mode if self.config.vision_trainable else False)
         return self
 
-    @torch.no_grad()
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """uint8 RGB [B,V,3,H,W] -> float32 [B,V,grid**2,Dv]."""
         cfg = self.config
@@ -102,7 +111,14 @@ class FrozenVisionTokens(nn.Module):
             )
             mean = values.new_tensor((0.485, 0.456, 0.406))[None, :, None, None]
             std = values.new_tensor((0.229, 0.224, 0.225))[None, :, None, None]
-            features = backbone.forward_features((values - mean) / std)["x_norm_patchtokens"]
+            values = (values - mean) / std
+        # Frozen features preserve the original float32 cache contract. During
+        # fine-tuning, respect the trainer's autocast and the caller's grad mode.
+        precision = nullcontext() if cfg.vision_trainable else torch.autocast(
+            device_type=images.device.type, enabled=False,
+        )
+        with torch.set_grad_enabled(torch.is_grad_enabled() and cfg.vision_trainable), precision:
+            features = backbone.forward_features(values)["x_norm_patchtokens"]
             native = cfg.vision_image_size // 14
             if features.shape[1:] != (native * native, cfg.vision_feature_dim):
                 raise ValueError("vision_feature_dim does not match the loaded DINO backbone")
@@ -110,7 +126,7 @@ class FrozenVisionTokens(nn.Module):
             spatial = F.adaptive_avg_pool2d(spatial, (cfg.vision_grid_size, cfg.vision_grid_size))
             return spatial.flatten(2).transpose(1, 2).reshape(
                 batch, views, cfg.vision_grid_size ** 2, cfg.vision_feature_dim,
-            ).contiguous()
+            ).contiguous().float()
 
 
 class FrozenTextTokens(nn.Module):
@@ -168,12 +184,12 @@ class FrozenTextTokens(nn.Module):
 
 
 class ObservationEncoder(nn.Module):
-    """Frozen encoders + trainable token projections and modality embeddings."""
+    """Configurable vision, frozen text, and trainable projections/embeddings."""
 
     def __init__(self, config: EncoderConfig) -> None:
         super().__init__()
         self.config = config
-        self.vision = FrozenVisionTokens(config)
+        self.vision = VisionTokens(config)
         self.text = FrozenTextTokens(config)
         self.vision_projection = nn.Linear(config.vision_feature_dim, config.dim)
         self.text_projection = nn.Linear(config.text_feature_dim, config.dim)
@@ -185,7 +201,12 @@ class ObservationEncoder(nn.Module):
         self.register_buffer("proprio_std", torch.ones(config.proprio_dim))
 
     def frozen_backbone_prefixes(self) -> tuple[str, ...]:
-        return ("vision.backbone.", "text.backbone.")
+        return ("text.backbone.",) if self.config.vision_trainable else ("vision.backbone.", "text.backbone.")
+
+    def initialize_trainable_backbones(self, device: torch.device) -> None:
+        """Materialize trainable weights before optimizer/EMA creation or restore."""
+        if self.config.vision_trainable:
+            self.vision._load(device)
 
     @torch.no_grad()
     def set_proprio_statistics(self, mean: torch.Tensor, std: torch.Tensor) -> None:
@@ -203,6 +224,8 @@ class ObservationEncoder(nn.Module):
             raise ValueError("proprio must be [B, proprio_dim]")
         batch = proprio.shape[0]
         vision = observation.get("vision_features")
+        if vision is not None and cfg.vision_trainable:
+            raise ValueError("Image feature caches cannot be used with a trainable vision encoder; provide images")
         if vision is None:
             vision = self.vision(observation["images"])
         expected = (batch, cfg.num_views, cfg.vision_grid_size ** 2, cfg.vision_feature_dim)

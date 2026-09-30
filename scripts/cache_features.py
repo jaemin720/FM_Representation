@@ -18,7 +18,7 @@ from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from repr_fm.data import LiberoDataset, LiberoDatasetConfig, _demo_keys
-from repr_fm.encoders import EncoderConfig, FrozenTextTokens, FrozenVisionTokens
+from repr_fm.encoders import EncoderConfig, FrozenTextTokens, VisionTokens
 
 
 def main() -> None:
@@ -33,10 +33,12 @@ def main() -> None:
     config = yaml.safe_load(args.config.read_text())
     data_config = replace(LiberoDatasetConfig(**config["data"]), feature_cache_dir=None)
     encoder_config = EncoderConfig(**config["model"]["encoder"])
+    # Fail before loading weights or writing files when fine-tuning is enabled.
+    encoder_config.cache_signature()
     dataset = LiberoDataset(data_config)
     dataset.validate_feature_cache(encoder_config)
     device = torch.device(args.device)
-    vision = FrozenVisionTokens(encoder_config).to(device).eval()
+    vision = VisionTokens(encoder_config).to(device).eval()
     text = FrozenTextTokens(encoder_config).to(device).eval()
     output = args.output_dir.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)

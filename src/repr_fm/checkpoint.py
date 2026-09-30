@@ -1,4 +1,4 @@
-"""Versioned checkpoints for RepresentationFM; no pretrained backbone weights.
+"""Versioned checkpoints including fine-tuned, but excluding frozen, backbones.
 
 Training-state handling is adapted from practice/DP/scripts/train.py. This
 schema intentionally cannot load the legacy task-ID DP/FM checkpoints.
@@ -77,6 +77,9 @@ def validate_schema(payload: dict[str, Any]) -> None:
 
 
 def make_model_payload(model: nn.Module, ema: EMA | None = None) -> dict[str, Any]:
+    encoder = getattr(model, "encoder", None)
+    if encoder is not None and encoder.config.vision_trainable and encoder.vision.backbone is None:
+        raise ValueError("Initialize the trainable vision backbone before creating a checkpoint")
     payload = {
         "schema": CHECKPOINT_SCHEMA,
         "model_config": model.checkpoint_config(),
@@ -98,15 +101,20 @@ def load_model_state(model: nn.Module, payload: dict[str, Any], weights: str = "
 
     Call before freezing the whole policy for evaluation. Frozen backbone
     modules may be absent (lazy) or loaded; their weights never enter this state.
+    Trainable backbones are initialized before validating/restoring their state.
     """
     validate_schema(payload)
-    if payload.get("model_config") != model.checkpoint_config():
+    # v1 frozen checkpoints predate the optional fine-tuning flag.
+    saved_config = payload.get("model_config", {})
+    saved_config = {**saved_config, "encoder": {"vision_trainable": False, **saved_config.get("encoder", {})}}
+    if saved_config != model.checkpoint_config():
         raise ValueError("Checkpoint model configuration differs from the constructed policy")
     if weights not in ("raw", "ema"):
         raise ValueError("weights must be 'raw' or 'ema'")
     key = "model_trainable" if weights == "raw" else "ema"
     if key not in payload:
         raise ValueError(f"Checkpoint has no {weights} parameters")
+    model.encoder.initialize_trainable_backbones(next(model.parameters()).device)
     expected_parameters = {name: value for name, value in model.named_parameters() if value.requires_grad}
     expected_buffers = persistent_buffers(model)
     state, buffers = payload[key], payload.get("model_buffers", {})

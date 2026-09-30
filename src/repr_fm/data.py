@@ -155,6 +155,8 @@ class LiberoDataset(Dataset[dict[str, Any]]):
         if len(self.config.camera_keys) != encoder_config.num_views:
             raise ValueError("Dataset cameras and encoder num_views differ")
         if self.cache_manifest is not None:
+            if encoder_config.vision_trainable:
+                raise ValueError("Image feature caches cannot be used with a trainable vision encoder")
             if self.cache_manifest.get("encoder") != encoder_config.cache_signature():
                 raise ValueError("Token cache was created with a different frozen encoder configuration")
 

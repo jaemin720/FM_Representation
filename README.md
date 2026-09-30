@@ -14,14 +14,14 @@ Representation 연구를 위한 독립 프로젝트입니다. 실행 경계는 �
 LIBERO 데이터/rollout 처리를 가져와 분리했습니다. 기존 DP 디렉토리에 런타임
 의존성이 없으며, 기존 프로젝트의 파일·실험 결과를 변경하지 않습니다.
 이는 새 입력 구조의 연구용 baseline이며 **아직 LIBERO-10 성공률이나 RTX 3090
-학습시간을 측정한 모델이 아닙니다.** 기존 FM의 70.5%/약 2시간 수치를 이 모델의
+전체 학습시간을 측정한 모델이 아닙니다.** 기존 FM의 70.5%/약 2시간 수치를 이 모델의
 결과로 사용할 수 없습니다.
 
 ## 모듈 경계
 
 | 파일 | 역할 / 수정 지점 |
 |---|---|
-| `src/repr_fm/encoders.py` | Frozen DINOv2 spatial features, frozen BERT language tokens, trainable projections, camera/spatial/modality embeddings, proprio normalization |
+| `src/repr_fm/encoders.py` | 선택적으로 학습하는 DINOv2 spatial features, frozen BERT language tokens, trainable projections, camera/spatial/modality embeddings, proprio normalization |
 | `src/repr_fm/interfaces.py` | `TokenBatch(tokens, padding_mask)` 공통 계약. Mask의 `True`는 padding |
 | `src/repr_fm/representation.py` | 기본 multimodal Transformer와 `auxiliary_loss()` 연구 확장 지점 |
 | `src/repr_fm/conditioning.py` | Representation 이후 masked mean pooling + MLP. Action head에 전달하는 유일한 관측 경로 |
@@ -46,7 +46,7 @@ Euler sampling 4회는 유지합니다. 이 U-Net은 약 227M parameters이므�
 
 ## 실행
 
-이 워크스페이스에서는 frozen backbone 실행에 필요한 패키지가 있는
+이 워크스페이스에서는 pretrained backbone 실행에 필요한 패키지가 있는
 `turbovla-libero` 환경을 사용할 수 있습니다. 스크립트가 `src`를 추가하므로
 editable 설치 없이 실행할 수 있습니다. 다른 환경은 `pyproject.toml`의 의존성과
 LIBERO/MuJoCo 환경을 준비합니다. 기존 `diffusion_policy` 환경은 cached-feature
@@ -63,7 +63,28 @@ FM_PYTHON=/home/jack/miniforge3/envs/turbovla-libero/bin/python
   --output-dir outputs/libero10_fm_baseline
 ```
 
-기본 batch size 16은 시작 설정입니다. GPU 메모리/throughput을 측정해 조정해야 합니다.
+기본 config는 DINOv2와 BERT를 모두 고정하는 대조군입니다.
+**DINOv2 학습 + BERT 고정** 실험은 다음 config를 사용합니다. 원본 이미지를 매번
+인코딩하며 이미지 feature cache를 사용하지 않습니다. 고정한 BERT의 문장 출력은
+메모리에서 재사용합니다.
+
+```bash
+CUDA_VISIBLE_DEVICES=GPU-7e7d7f97-c512-32b6-0a17-bfa6c8d19fe5 \
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+"$FM_PYTHON" scripts/train.py \
+  --config configs/libero10_fm_dinov2_finetune.yaml \
+  --device cuda --output-dir outputs/libero10_fm_dinov2_finetune
+```
+
+Fine-tuning config는 batch 16, BF16, 100,000 step, warmup 500 step과 cosine decay를
+사용합니다. 초기 최대 학습률은 DINOv2 `1e-5`, 나머지 trainable 모듈 `1e-4`입니다.
+`model.encoder.vision_trainable: true`이면 optimizer와 EMA를 만들기 전에 DINOv2를
+로드하며, 학습한 DINOv2 가중치와 EMA도 checkpoint에 저장·복원합니다.
+이미지 feature cache의 생성과 사용은 이 설정에서 오류로 막습니다.
+
+RTX 3090의 짧은 자원 측정에서 이 구조는 batch 16에 약 10.8 GiB를 사용했습니다.
+처리 속도는 실제 데이터 로딩을 포함해 약 0.244초/step이었으며, 전체 학습 시간이나
+성공률을 검증한 결과는 아닙니다. 장기 실행 중 실제 속도를 로그로 확인하세요.
 `text_local_files_only: true`이므로 가중치가 없으면 다운로드 대신 오류를 냅니다.
 다른 머신에서는 `vision_repository`, dataset 경로 및 text encoder 경로/revision을
 맞춰야 합니다. Frozen pretrained weights는 checkpoint에 포함되지 않으므로 같은
@@ -89,8 +110,8 @@ Trainable projection, representation, conditioning은 매 update 다시 계산�
 오류로 처리합니다. 기본 float32 vision cache는 frame당 약 384 KiB,
 10만 frame이면 약 36.6 GiB입니다. Cache 생성은 데이터 전체를 처리하므로
 필요한 저장 공간과 생성 시간을 고려해 direct/cached 경로를 선택하세요.
-Encoder fine-tuning이나 매번 바뀌는 image augmentation은 현재 frozen-cache
-실험 범위에 포함되지 않습니다.
+Encoder fine-tuning이나 매번 바뀌는 image augmentation에는 이미지 feature cache를
+사용할 수 없습니다. Fine-tuning 실행은 위의 별도 config와 raw 이미지 경로를 사용합니다.
 
 재개할 때는 같은 config, 총 학습 step, batch size를 사용합니다.
 
@@ -142,7 +163,8 @@ def auxiliary_loss(self, encoded, represented, batch):
 
 전체 loss는 `flow_loss + representation_loss_weight * representation_loss`입니다.
 기본 hook은 0이며 아직 특정 representation-learning 기법을 구현하지 않았습니다.
-FM loss는 trainable encoder projection, representation, conditioning까지 역전파됩니다.
+FM loss는 trainable encoder projection, representation, conditioning까지 역전파되며,
+`vision_trainable: true`이면 DINOv2 backbone까지 업데이트합니다.
 `Z.detach()` 또는 전체 conditioning cache를 사용하면 이 학습 경로가 끊깁니다.
 
 공정한 실험에서는 같은 fusion 구조에서 auxiliary loss의 유무를 먼저 비교하세요.
@@ -162,12 +184,14 @@ encoding, sampling, normalization, strict raw/EMA checkpoint 복원을 확인합
 로컬의 기존 DP 소스가 있으면 동일 U-Net weights의 수치적 일치도 확인합니다.
 이 검증은 학습 후 LIBERO 성공률이나 GPU 학습 benchmark를 대체하지 않습니다.
 
-작성 시 확인한 결과: CPU 테스트 31개 통과, 실제 LIBERO 영상/지시문과 로컬
+검증 결과: CPU 테스트 36개 통과. Fine-tuning 시 raw image에서 DINOv2의 optimizer
+update, BERT 고정, lazy model로 raw/EMA 가중치 복원, feature cache 거부를 포함합니다.
+초기 구현에서는 실제 LIBERO 영상/지시문과 로컬
 DINOv2/BERT를 사용한 소형 policy의 loss/backward/sampling 통과, raw 입력과
 cached 입력의 encoder 출력 일치, 실제 2-frame token cache 생성/읽기 통과.
 합성 데이터의 4-step 학습과 중간 checkpoint 재개 결과도 파라미터·EMA가
-일치했습니다. 이 실행 환경에서는 CUDA를 사용할 수 없어 GPU 메모리/속도와
-멀티워커 simulator rollout은 검증하지 않았습니다.
+일치했습니다. 이후 RTX 3090 GPU 1에서 DINOv2만 학습하거나 BERT까지 학습하는
+별도 자원 측정을 수행했습니다. 멀티워커 simulator rollout은 검증하지 않았습니다.
 
 ## 출처
 
